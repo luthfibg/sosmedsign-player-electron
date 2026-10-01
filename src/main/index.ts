@@ -1,33 +1,55 @@
-import { app, shell, BrowserWindow, ipcMain } from 'electron'
+import { app, shell, BrowserWindow } from 'electron'
 import { join } from 'path'
 import { electronApp, optimizer, is } from '@electron-toolkit/utils'
 import icon from '../../resources/icon.png?asset'
+import { loadConfig } from './config'
+import { openDatabase, type Db } from './db/database'
+import { registerIpc } from './ipc/register-ipc'
+import { ApiClient } from './services/api-client'
+import { CredentialStore } from './services/credential-store'
+import { DeviceService } from './services/device-service'
+import { Diagnostics } from './services/diagnostics'
+import { createSafeStorageCipher } from './services/electron-cipher'
+
+// Video/gambar harus bisa autoplay tanpa interaksi pengguna (signage tanpa keyboard/mouse).
+app.commandLine.appendSwitch('autoplay-policy', 'no-user-gesture-required')
+
+let mainWindow: BrowserWindow | null = null
+let db: Db | null = null
+let apiClient: ApiClient | null = null
+let disposeIpc: (() => void) | null = null
 
 function createWindow(): void {
-  // Create the browser window.
-  const mainWindow = new BrowserWindow({
-    width: 900,
-    height: 670,
+  mainWindow = new BrowserWindow({
+    width: 1280,
+    height: 720,
     show: false,
     autoHideMenuBar: true,
+    backgroundColor: '#000000',
+    // Produksi: kiosk layar penuh. Dev: jendela biasa supaya DevTools mudah dipakai.
+    fullscreen: !is.dev,
+    kiosk: !is.dev,
     ...(process.platform === 'linux' ? { icon } : {}),
     webPreferences: {
       preload: join(__dirname, '../preload/index.js'),
-      sandbox: false
+      sandbox: false,
+      contextIsolation: true,
+      nodeIntegration: false
     }
   })
 
-  mainWindow.on('ready-to-show', () => {
-    mainWindow.show()
+  mainWindow.on('ready-to-show', () => mainWindow?.show())
+  mainWindow.on('closed', () => {
+    mainWindow = null
   })
 
+  // Player hanya menampilkan UI lokal: tolak semua navigasi dan window baru.
+  mainWindow.webContents.on('will-navigate', (event) => event.preventDefault())
   mainWindow.webContents.setWindowOpenHandler((details) => {
-    shell.openExternal(details.url)
+    if (is.dev) shell.openExternal(details.url)
     return { action: 'deny' }
   })
 
-  // HMR for renderer base on electron-vite cli.
-  // Load the remote URL for development or the local html file for production.
   if (is.dev && process.env['ELECTRON_RENDERER_URL']) {
     mainWindow.loadURL(process.env['ELECTRON_RENDERER_URL'])
   } else {
@@ -35,40 +57,58 @@ function createWindow(): void {
   }
 }
 
-// This method will be called when Electron has finished
-// initialization and is ready to create browser windows.
-// Some APIs can only be used after this event occurs.
-app.whenReady().then(() => {
-  // Set app user model id for windows
-  electronApp.setAppUserModelId('com.electron')
-
-  // Default open or close DevTools by F12 in development
-  // and ignore CommandOrControl + R in production.
-  // see https://github.com/alex8088/electron-toolkit/tree/master/packages/utils
-  app.on('browser-window-created', (_, window) => {
-    optimizer.watchWindowShortcuts(window)
+// Satu instance saja: MiniPC tidak boleh menjalankan dua player sekaligus.
+if (!app.requestSingleInstanceLock()) {
+  app.quit()
+} else {
+  app.on('second-instance', () => {
+    if (mainWindow) {
+      if (mainWindow.isMinimized()) mainWindow.restore()
+      mainWindow.focus()
+    }
   })
 
-  // IPC test
-  ipcMain.on('ping', () => console.log('pong'))
+  app.whenReady().then(() => {
+    electronApp.setAppUserModelId('com.solusimediakarya.sosmedsignplayer')
 
-  createWindow()
+    app.on('browser-window-created', (_, window) => {
+      optimizer.watchWindowShortcuts(window)
+    })
 
-  app.on('activate', function () {
-    // On macOS it's common to re-create a window in the app when the
-    // dock icon is clicked and there are no other windows open.
-    if (BrowserWindow.getAllWindows().length === 0) createWindow()
+    const userData = app.getPath('userData')
+    const diagnostics = new Diagnostics(join(userData, 'logs'))
+    diagnostics.log(`Player mulai (v${app.getVersion()}, Electron ${process.versions.electron})`)
+
+    const config = loadConfig()
+    diagnostics.log(
+      `Backend: ${config.baseUrl}${config.hostHeader ? ` (Host ${config.hostHeader})` : ''}`
+    )
+
+    db = openDatabase(join(userData, 'player.db'))
+    const credentials = new CredentialStore(
+      userData,
+      createSafeStorageCipher(),
+      undefined,
+      (message) => diagnostics.log(`Kredensial: ${message}`)
+    )
+    apiClient = new ApiClient(config)
+    const deviceService = new DeviceService(apiClient, credentials, diagnostics)
+    disposeIpc = registerIpc({ deviceService, diagnostics })
+
+    createWindow()
+
+    app.on('activate', () => {
+      if (BrowserWindow.getAllWindows().length === 0) createWindow()
+    })
   })
-})
 
-// Quit when all windows are closed, except on macOS. There, it's common
-// for applications and their menu bar to stay active until the user quits
-// explicitly with Cmd + Q.
-app.on('window-all-closed', () => {
-  if (process.platform !== 'darwin') {
-    app.quit()
-  }
-})
+  app.on('before-quit', () => {
+    disposeIpc?.()
+    void apiClient?.close()
+    db?.close()
+  })
 
-// In this file you can include the rest of your app's specific main process
-// code. You can also put them in separate files and require them here.
+  app.on('window-all-closed', () => {
+    if (process.platform !== 'darwin') app.quit()
+  })
+}

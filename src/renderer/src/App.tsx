@@ -1,33 +1,46 @@
-import Versions from './components/Versions'
-import electronLogo from './assets/electron.svg'
+import { useCallback, useEffect, useState } from 'react'
+import ActivationScreen from './screens/ActivationScreen'
+import DiagnosticsOverlay from './screens/DiagnosticsOverlay'
+import PlayerScreen from './screens/PlayerScreen'
 
 function App(): React.JSX.Element {
-  const ipcHandle = (): void => window.electron.ipcRenderer.send('ping')
+  const [state, setState] = useState<DeviceStateDto | null>(null)
+  const [diagnosticsOpen, setDiagnosticsOpen] = useState(false)
+
+  useEffect(() => {
+    let cancelled = false
+    window.api.getDeviceState().then((s) => {
+      if (!cancelled) setState(s)
+    })
+    const unsubscribe = window.api.onDeviceStateChanged(setState)
+    return () => {
+      cancelled = true
+      unsubscribe()
+    }
+  }, [])
+
+  // Pintasan keyboard pengganti tombol INFO/MENU di remote Android: Ctrl+Shift+D.
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent): void => {
+      if (event.ctrlKey && event.shiftKey && event.key.toLowerCase() === 'd') {
+        event.preventDefault()
+        setDiagnosticsOpen((open) => !open)
+      } else if (event.key === 'Escape') {
+        setDiagnosticsOpen(false)
+      }
+    }
+    window.addEventListener('keydown', onKeyDown)
+    return () => window.removeEventListener('keydown', onKeyDown)
+  }, [])
+
+  const closeDiagnostics = useCallback(() => setDiagnosticsOpen(false), [])
+
+  if (!state) return <div className="screen" />
 
   return (
     <>
-      <img alt="logo" className="logo" src={electronLogo} />
-      <div className="creator">Powered by electron-vite</div>
-      <div className="text">
-        Build an Electron app with <span className="react">React</span>
-        &nbsp;and <span className="ts">TypeScript</span>
-      </div>
-      <p className="tip">
-        Please try pressing <code>F12</code> to open the devTool
-      </p>
-      <div className="actions">
-        <div className="action">
-          <a href="https://electron-vite.org/" target="_blank" rel="noreferrer">
-            Documentation
-          </a>
-        </div>
-        <div className="action">
-          <a target="_blank" rel="noreferrer" onClick={ipcHandle}>
-            Send IPC
-          </a>
-        </div>
-      </div>
-      <Versions></Versions>
+      {state.registered ? <PlayerScreen state={state} /> : <ActivationScreen state={state} />}
+      {diagnosticsOpen && <DiagnosticsOverlay onClose={closeDiagnostics} />}
     </>
   )
 }

@@ -1,22 +1,20 @@
-import { contextBridge } from 'electron'
-import { electronAPI } from '@electron-toolkit/preload'
+import { contextBridge, ipcRenderer } from 'electron'
+import { IPC } from '../main/ipc/channels'
 
-// Custom APIs for renderer
-const api = {}
-
-// Use `contextBridge` APIs to expose Electron APIs to
-// renderer only if context isolation is enabled, otherwise
-// just add to the DOM global.
-if (process.contextIsolated) {
-  try {
-    contextBridge.exposeInMainWorld('electron', electronAPI)
-    contextBridge.exposeInMainWorld('api', api)
-  } catch (error) {
-    console.error(error)
+const api: PlayerApi = {
+  getDeviceState: () => ipcRenderer.invoke(IPC.getDeviceState),
+  activate: (activationCode) => ipcRenderer.invoke(IPC.activate, activationCode),
+  resetIdentity: () => ipcRenderer.invoke(IPC.resetIdentity),
+  getDiagnostics: () => ipcRenderer.invoke(IPC.getDiagnostics),
+  onDeviceStateChanged: (callback) => {
+    const listener = (_event: Electron.IpcRendererEvent, state: DeviceStateDto): void =>
+      callback(state)
+    ipcRenderer.on(IPC.deviceStateChanged, listener)
+    return () => {
+      ipcRenderer.removeListener(IPC.deviceStateChanged, listener)
+    }
   }
-} else {
-  // @ts-ignore (define in dts)
-  window.electron = electronAPI
-  // @ts-ignore (define in dts)
-  window.api = api
 }
+
+// Hanya `api` yang diekspos (bukan ipcRenderer mentah) supaya renderer tidak bisa memanggil kanal sembarang.
+contextBridge.exposeInMainWorld('api', api)

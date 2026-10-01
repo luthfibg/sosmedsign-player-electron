@@ -44,7 +44,7 @@ Gagal → `422 {"message": "..."}` (kode salah/kedaluwarsa dst). **`api_token` h
 Response: `registration_status` (`pending`|`registered`), `venue_id`, `slot_capacity`, `slot_duration_seconds`.
 **Tidak lagi mengembalikan `api_token`** (walau model Kotlin masih punya field nullable-nya).
 Artinya: kalau kredensial lokal hilang tapi CMS masih menganggap device `registered`, player tidak bisa mendapat token baru
-lewat endpoint ini (lihat catatan auto-recovery di bagian 4.4).
+lewat endpoint ini; pemulihannya lewat kode reissue dari CMS (lihat bagian 4.4).
 
 ### 2.3 `GET /devices/{device_code}/playlist`
 - `404` `{message}` → belum ada snapshot (device valid; normal untuk device yang baru diklaim).
@@ -111,7 +111,7 @@ Response `{ "inserted": n }`.
 
 ### 4.1 Startup
 - Kalau `registered` + ada `api_token` → mode player, tampil loading, mulai loop sync.
-- Kalau belum → layar aktivasi + auto-recovery loop (4.4).
+- Kalau belum → layar aktivasi (kode aktivasi biasa, atau kode reissue dari CMS; lihat 4.4).
 - Auto-start saat boot (Android: `BootCompletedReceiver`). Di Windows: setara auto-login + startup entry.
 
 ### 4.2 Loop sync
@@ -121,7 +121,7 @@ Response `{ "inserted": n }`.
 - Playback log yang antre diunggah **menumpang** di siklus sync yang sama (tidak ada job terpisah).
 
 ### 4.3 Validasi registrasi & masa tenggang (dibuat setelah insiden)
-Sebelum sync, player memanggil `registration-status` (publik) untuk memvalidasi bahwa device masih terdaftar:
+Sebelum sync, player memanggil `registration-status` (publik; di Electron: `DeviceService.validateRegistration()`) untuk memvalidasi bahwa device masih terdaftar:
 - `registered` → reset counter gagal.
 - `pending` (404 dengan body JSON API kita) atau `Unavailable` (401/403, atau 404 yang body-nya bukan JSON API,
   error jaringan) → counter gagal +1.
@@ -130,11 +130,15 @@ Sebelum sync, player memanggil `registration-status` (publik) untuk memvalidasi 
 - Alasan: pernah terjadi device ter-reset paksa hanya karena koneksi putus / captive portal / proxy yang membalas 401/403/404
   dengan HTML. **Respons HTTP error hanya dipercaya kalau body-nya JSON `{message}` milik API kita.**
 
-### 4.4 Auto-recovery (di layar aktivasi)
-Loop tiap **2 menit** memanggil `registration-status`; kalau `registered`, player mencoba pulih tanpa kode baru.
-Catatan port: karena `registration-status` sekarang **tidak mengirim token**, jalur ini di Android praktis hanya berhasil kalau
-response memuat `api_token` (di kode saat ini `checkRegistrationStatus` menganggap `registered` tanpa token sebagai error).
-Verifikasi perilaku aktualnya sebelum meniru.
+### 4.4 Auto-recovery (Android) dan penggantinya: kode reissue
+Android menjalankan loop tiap **2 menit** ke `registration-status` di layar aktivasi. Karena endpoint itu **tidak lagi mengirim `api_token`**,
+jalur ini praktis mati dan **tidak diporting ke Electron**.
+
+Pemulihan yang berlaku sekarang ada di backend: admin menerbitkan **kode reissue** dari halaman device di CMS
+(`DeviceRegistrationService::regenerateCredentialsCode`, berlaku 24 jam). Kode itu terikat ke `device_code` yang SAMA dan hanya
+menukar ulang `api_token` (slot, booking, dan riwayat sync tidak disentuh). Player cukup memakai alur aktivasi biasa (bagian 3)
+dengan `device_code` lama. **Karena itu `device_code` wajib dipertahankan saat kredensial hilang/rusak**; hanya "Reset identitas"
+yang boleh membuat UUID baru (dan itu butuh kode aktivasi biasa, bukan reissue).
 
 ### 4.5 Device dilepas / token dicabut
 - Sync menerima `401/403` dari `/playlist`, `/sync-log`, atau download konten → `DeviceReleased`.
@@ -216,7 +220,9 @@ Verifikasi perilaku aktualnya sebelum meniru.
 
 Field: `device_code` (UUID, permanen), `api_token`, `pairing_token`/`pairing_expires_at` (sisa alur lama), `venue_id`,
 `slot_capacity` (default 20), `slot_duration_seconds` (default 15), `registration_status`, preferensi `keep_screen_on` (default true).
-Android memakai `EncryptedSharedPreferences` (AES-256). Di Electron: `safeStorage` (DPAPI di Windows) atau setara.
+Android memakai `EncryptedSharedPreferences` (AES-256). Di Electron: `device.json` (plaintext, hanya `deviceCode`, bukan rahasia) + `credentials.bin` (terenkripsi `safeStorage`/DPAPI, berisi
+`api_token` dan konfigurasi server). Dipisah agar identitas tetap utuh kalau kredensial tidak bisa didekripsi (mis. image Windows dikloning ke
+user lain), sehingga jalur kode reissue (bagian 4.4) tetap bisa dipakai. `pairing_token`/`pairing_expires_at` (alur lama) tidak diporting.
 
 ## 12. Temuan & rekomendasi untuk port Electron
 
