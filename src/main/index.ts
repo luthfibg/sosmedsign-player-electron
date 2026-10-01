@@ -121,7 +121,12 @@ if (!app.requestSingleInstanceLock()) {
       }
     })
     if (wasRegistered) syncService.start()
-    disposeIpc = registerIpc({ deviceService, diagnostics })
+    disposeIpc = registerIpc({
+      deviceService,
+      diagnostics,
+      syncService,
+      isOnline: () => net.isOnline()
+    })
 
     createWindow()
 

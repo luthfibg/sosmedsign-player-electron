@@ -6,6 +6,12 @@ interface Props {
 
 function DiagnosticsOverlay({ onClose }: Props): React.JSX.Element {
   const [lines, setLines] = useState<string[]>([])
+  const [indicators, setIndicators] = useState<DiagnosticsIndicatorsDto>({
+    online: { state: 'unknown', detail: 'Memuat status jaringan' },
+    connected: { state: 'unknown', detail: 'Memuat status CMS' },
+    sync: { state: 'unknown', detail: 'Memuat status sync' },
+    playback: { state: 'unknown', detail: 'Memuat status playback' }
+  })
   const [confirmReset, setConfirmReset] = useState(false)
 
   useEffect(() => {
@@ -14,6 +20,20 @@ function DiagnosticsOverlay({ onClose }: Props): React.JSX.Element {
       window.api.getDiagnostics().then((l) => {
         if (!cancelled) setLines(l)
       })
+      window.api
+        .getDiagnosticIndicators()
+        .then((status) => {
+          if (!cancelled) setIndicators(status)
+        })
+        .catch(() => {
+          if (cancelled) return
+          setIndicators({
+            online: { state: 'unknown', detail: 'Status jaringan tidak tersedia' },
+            connected: { state: 'unknown', detail: 'Status CMS tidak tersedia' },
+            sync: { state: 'unknown', detail: 'Status sync tidak tersedia' },
+            playback: { state: 'unknown', detail: 'Status playback tidak tersedia' }
+          })
+        })
     }
     refresh()
     const timer = setInterval(refresh, 1000)
@@ -27,6 +47,13 @@ function DiagnosticsOverlay({ onClose }: Props): React.JSX.Element {
     await window.api.resetIdentity()
     setConfirmReset(false)
   }
+
+  const indicatorItems = [
+    { label: 'Connected', status: indicators.connected },
+    { label: 'Online', status: indicators.online },
+    { label: 'Sync', status: indicators.sync },
+    { label: 'Playback', status: indicators.playback }
+  ]
 
   return (
     <div className="overlay">
@@ -49,7 +76,22 @@ function DiagnosticsOverlay({ onClose }: Props): React.JSX.Element {
           <button onClick={onClose}>Tutup (Esc)</button>
         </div>
       </div>
-      <pre className="log">{lines.length === 0 ? '(belum ada log)' : lines.join('\n')}</pre>
+      <div className="diagnostic-output">
+        <div className="diagnostic-indicators" role="status" aria-label="Status perangkat">
+          {indicatorItems.map(({ label, status }) => (
+            <div
+              className="diagnostic-indicator"
+              key={label}
+              title={status.detail}
+              aria-label={`${label}: ${status.detail}`}
+            >
+              <span className={`indicator-lamp ${status.state}`} aria-hidden="true" />
+              <span>{label}</span>
+            </div>
+          ))}
+        </div>
+        <pre className="log">{lines.length === 0 ? '(belum ada log)' : lines.join('\n')}</pre>
+      </div>
     </div>
   )
 }

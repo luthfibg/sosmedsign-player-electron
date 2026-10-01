@@ -4,5 +4,6 @@ export const IPC = {
   activate: 'device:activate',
   resetIdentity: 'device:reset-identity',
   deviceStateChanged: 'device:state-changed',
-  getDiagnostics: 'diagnostics:get'
+  getDiagnostics: 'diagnostics:get',
+  getDiagnosticIndicators: 'diagnostics:get-indicators'
 } as const

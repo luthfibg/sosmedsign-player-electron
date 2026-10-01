@@ -255,13 +255,16 @@ describe('SyncService mirror sync', () => {
 
     const result = await context.service.syncOnce()
 
-    expect(result).toBe('applied')
+    expect(result).toBe('partial')
     expect(context.db.playlists).toHaveLength(1)
     expect(context.db.playlists[0]).toMatchObject({ version_hash: 'new-version', is_active: 1 })
     expect(context.db.items.map((item) => item.download_status)).toEqual(['READY', 'FAILED'])
     expect(context.logs).toEqual([
       { playlist_version_hash: 'new-version', status: 'partial', bytes_downloaded: 5 }
     ])
+    const indicators = context.service.getDiagnosticIndicators(true, true)
+    expect(indicators.connected.state).toBe('active')
+    expect(indicators.sync.state).toBe('warning')
     expect(existsSync(staleFile)).toBe(false)
     await context.cache.close()
   })
@@ -321,6 +324,27 @@ describe('SyncService mirror sync', () => {
 
     expect(result).toBe('offline')
     expect(context.device.validateRegistration).not.toHaveBeenCalled()
+    expect(context.api.playlist).not.toHaveBeenCalled()
+    await context.cache.close()
+  })
+
+  it('shows CMS unavailable when registration validation cannot reach the API', async () => {
+    const context = setup(
+      { status: 200, json: response([dto(1, 'https://cdn.example.test/a.mp4')]) },
+      async () => ({ statusCode: 200, body: Readable.from([Buffer.from('content')]) })
+    )
+    vi.mocked(context.device.validateRegistration).mockResolvedValue({
+      kind: 'unavailable',
+      reason: 'connection timeout'
+    })
+
+    const result = await context.service.syncOnce()
+
+    expect(result).toBe('validation-grace')
+    expect(context.service.getDiagnosticIndicators(true, true)).toMatchObject({
+      connected: { state: 'inactive' },
+      sync: { state: 'warning' }
+    })
     expect(context.api.playlist).not.toHaveBeenCalled()
     await context.cache.close()
   })

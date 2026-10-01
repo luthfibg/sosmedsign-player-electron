@@ -17,6 +17,7 @@ export type SyncOutcome =
   | 'validation-grace'
   | 'released'
   | 'download-failed'
+  | 'partial'
   | 'error'
   | 'busy'
   | 'aborted'
@@ -55,6 +56,9 @@ export class SyncService {
   private timer: NodeJS.Timeout | null = null
   private syncInProgress = false
   private validationFailures = 0
+  private cmsConnected: boolean | null = null
+  private lastCmsResponseAt: number | null = null
+  private lastSyncOutcome: SyncOutcome | null = null
   /** Naik setiap data lokal dihapus (release/reset); sync yang sedang berjalan membuang hasilnya. */
   private generation = 0
   private readonly intervalMs: number
@@ -91,7 +95,38 @@ export class SyncService {
     await this.cache.close()
   }
 
+  getDiagnosticIndicators(
+    online: boolean,
+    registered: boolean
+  ): Pick<DiagnosticsIndicatorsDto, 'connected' | 'sync'> {
+    let connected: DiagnosticIndicatorDto
+    if (!registered) {
+      connected = { state: 'inactive', detail: 'Device belum terdaftar' }
+    } else if (!online) {
+      connected = { state: 'inactive', detail: 'Tidak ada koneksi jaringan' }
+    } else if (this.cmsConnected === null) {
+      connected = { state: 'unknown', detail: 'Menunggu pemeriksaan CMS pertama' }
+    } else if (!this.cmsConnected) {
+      connected = { state: 'inactive', detail: 'API CMS belum merespons' }
+    } else if (
+      this.lastCmsResponseAt !== null &&
+      Date.now() - this.lastCmsResponseAt > SYNC_INTERVAL_MS * 2
+    ) {
+      connected = { state: 'warning', detail: 'Respons CMS terakhir sudah lebih dari 6 menit' }
+    } else {
+      connected = { state: 'active', detail: 'API CMS merespons' }
+    }
+
+    return { connected, sync: this.getSyncIndicator() }
+  }
+
   async syncOnce(forceRefresh = false): Promise<SyncOutcome> {
+    const outcome = await this.performSyncOnce(forceRefresh)
+    if (outcome !== 'busy') this.lastSyncOutcome = outcome
+    return outcome
+  }
+
+  private async performSyncOnce(forceRefresh = false): Promise<SyncOutcome> {
     if (this.syncInProgress) return 'busy'
     this.cache.retryPendingDeletes()
     if (!this.credentials.isRegistered()) return 'not-registered'
@@ -101,6 +136,7 @@ export class SyncService {
     const generation = this.generation
     try {
       const validation = await this.device.validateRegistration()
+      this.recordCmsConnection(validation.kind !== 'unavailable')
       if (validation.kind === 'registered') {
         this.validationFailures = 0
       } else {
@@ -124,6 +160,11 @@ export class SyncService {
       if (!token) return 'not-registered'
 
       const response = await this.api.playlist(deviceCode, token, currentVersion)
+      this.recordCmsConnection(
+        response.status === 204 ||
+          (response.status === 200 && response.json !== null) ||
+          response.isApiMessage
+      )
       if (response.status === 204) {
         const retried = await this.retryFailedItems(generation)
         if (retried.released) return 'released'
@@ -240,7 +281,7 @@ export class SyncService {
     this.diagnostics.log(
       `Playlist ${response.version_hash.slice(0, 12)} aktif (${readyCount}/${prepared.length} konten siap, ${bytesDownloaded} byte)`
     )
-    return 'applied'
+    return status === 'partial' ? 'partial' : 'applied'
   }
 
   private activatePlaylist(response: PlaylistResponse, prepared: PreparedItem[]): void {
@@ -356,6 +397,9 @@ export class SyncService {
         status,
         bytes_downloaded: bytesDownloaded
       })
+      this.recordCmsConnection(
+        (response.status >= 200 && response.status < 300) || response.isApiMessage
+      )
       if ([401, 403].includes(response.status) && response.isApiMessage) {
         this.releaseLocalDevice(`sync-log ditolak (HTTP ${response.status})`)
         return false
@@ -372,6 +416,43 @@ export class SyncService {
 
   private releaseLocalDevice(reason: string): void {
     this.device.forgetRegistration(reason)
+  }
+
+  private recordCmsConnection(connected: boolean): void {
+    this.cmsConnected = connected
+    this.lastCmsResponseAt = Date.now()
+  }
+
+  private getSyncIndicator(): DiagnosticIndicatorDto {
+    if (this.syncInProgress) return { state: 'working', detail: 'Sinkronisasi sedang berjalan' }
+    if (this.lastSyncOutcome === null) {
+      return { state: 'unknown', detail: 'Belum ada percobaan sinkronisasi' }
+    }
+    switch (this.lastSyncOutcome) {
+      case 'applied':
+      case 'not-modified':
+        return { state: 'active', detail: 'Sinkronisasi terakhir berhasil' }
+      case 'partial':
+        return { state: 'warning', detail: 'Sebagian konten gagal diunduh' }
+      case 'download-failed':
+        return { state: 'error', detail: 'Semua unduhan konten gagal' }
+      case 'error':
+        return { state: 'error', detail: 'Sinkronisasi terakhir gagal' }
+      case 'released':
+        return { state: 'error', detail: 'Registrasi device dilepas' }
+      case 'offline':
+        return { state: 'warning', detail: 'Sinkronisasi dilewati saat offline' }
+      case 'no-playlist':
+        return { state: 'warning', detail: 'CMS belum memiliki playlist untuk device ini' }
+      case 'validation-grace':
+        return { state: 'warning', detail: 'Validasi CMS gagal; masa tenggang berjalan' }
+      case 'not-registered':
+        return { state: 'inactive', detail: 'Device belum terdaftar' }
+      case 'aborted':
+        return { state: 'warning', detail: 'Sinkronisasi dibatalkan' }
+      case 'busy':
+        return { state: 'working', detail: 'Sinkronisasi sedang berjalan' }
+    }
   }
 }
 

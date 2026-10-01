@@ -6,6 +6,7 @@ const api: PlayerApi = {
   activate: (activationCode) => ipcRenderer.invoke(IPC.activate, activationCode),
   resetIdentity: () => ipcRenderer.invoke(IPC.resetIdentity),
   getDiagnostics: () => ipcRenderer.invoke(IPC.getDiagnostics),
+  getDiagnosticIndicators: () => ipcRenderer.invoke(IPC.getDiagnosticIndicators),
   onDeviceStateChanged: (callback) => {
     const listener = (_event: Electron.IpcRendererEvent, state: DeviceStateDto): void =>
       callback(state)

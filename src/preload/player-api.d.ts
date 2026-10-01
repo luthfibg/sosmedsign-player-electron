@@ -15,11 +15,27 @@ declare global {
 
   type ActivationResultDto = { ok: true } | { ok: false; message: string }
 
+  type DiagnosticIndicatorState =
+    'active' | 'inactive' | 'warning' | 'error' | 'working' | 'unknown'
+
+  interface DiagnosticIndicatorDto {
+    state: DiagnosticIndicatorState
+    detail: string
+  }
+
+  interface DiagnosticsIndicatorsDto {
+    online: DiagnosticIndicatorDto
+    connected: DiagnosticIndicatorDto
+    sync: DiagnosticIndicatorDto
+    playback: DiagnosticIndicatorDto
+  }
+
   interface PlayerApi {
     getDeviceState(): Promise<DeviceStateDto>
     activate(activationCode: string): Promise<ActivationResultDto>
     resetIdentity(): Promise<void>
     getDiagnostics(): Promise<string[]>
+    getDiagnosticIndicators(): Promise<DiagnosticsIndicatorsDto>
     /** Mengembalikan fungsi untuk berhenti berlangganan. */
     onDeviceStateChanged(callback: (state: DeviceStateDto) => void): () => void
   }
