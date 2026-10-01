@@ -1,4 +1,4 @@
-import { app, shell, BrowserWindow } from 'electron'
+import { app, shell, BrowserWindow, net } from 'electron'
 import { join } from 'path'
 import { electronApp, optimizer, is } from '@electron-toolkit/utils'
 import icon from '../../resources/icon.png?asset'
@@ -10,6 +10,8 @@ import { CredentialStore } from './services/credential-store'
 import { DeviceService } from './services/device-service'
 import { Diagnostics } from './services/diagnostics'
 import { createSafeStorageCipher } from './services/electron-cipher'
+import { CacheManager } from './services/cache-manager'
+import { SyncService } from './services/sync-service'
 
 // Video/gambar harus bisa autoplay tanpa interaksi pengguna (signage tanpa keyboard/mouse).
 app.commandLine.appendSwitch('autoplay-policy', 'no-user-gesture-required')
@@ -18,6 +20,8 @@ let mainWindow: BrowserWindow | null = null
 let db: Db | null = null
 let apiClient: ApiClient | null = null
 let disposeIpc: (() => void) | null = null
+let syncService: SyncService | null = null
+let unsubscribeDeviceState: (() => void) | null = null
 
 function createWindow(): void {
   mainWindow = new BrowserWindow({
@@ -93,6 +97,30 @@ if (!app.requestSingleInstanceLock()) {
     )
     apiClient = new ApiClient(config)
     const deviceService = new DeviceService(apiClient, credentials, diagnostics)
+    const cacheManager = new CacheManager(
+      join(userData, 'content_cache'),
+      config,
+      undefined,
+      (message) => diagnostics.log(message)
+    )
+    syncService = new SyncService(
+      db,
+      apiClient,
+      deviceService,
+      credentials,
+      cacheManager,
+      diagnostics,
+      { isOnline: () => net.isOnline() }
+    )
+    const wasRegistered = deviceService.getState().registered
+    unsubscribeDeviceState = deviceService.onStateChange((state) => {
+      if (state.registered) {
+        syncService?.start()
+      } else {
+        syncService?.clearLocalData()
+      }
+    })
+    if (wasRegistered) syncService.start()
     disposeIpc = registerIpc({ deviceService, diagnostics })
 
     createWindow()
@@ -104,6 +132,8 @@ if (!app.requestSingleInstanceLock()) {
 
   app.on('before-quit', () => {
     disposeIpc?.()
+    unsubscribeDeviceState?.()
+    void syncService?.close()
     void apiClient?.close()
     db?.close()
   })
