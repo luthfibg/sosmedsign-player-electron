@@ -5,5 +5,10 @@ export const IPC = {
   resetIdentity: 'device:reset-identity',
   deviceStateChanged: 'device:state-changed',
   getDiagnostics: 'diagnostics:get',
-  getDiagnosticIndicators: 'diagnostics:get-indicators'
+  getDiagnosticIndicators: 'diagnostics:get-indicators',
+  getPlaylist: 'player:get-playlist',
+  playlistChanged: 'player:playlist-changed',
+  itemCompleted: 'player:item-completed',
+  playerStatus: 'player:status',
+  logPlayer: 'player:log'
 } as const

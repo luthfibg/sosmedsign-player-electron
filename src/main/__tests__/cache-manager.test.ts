@@ -1,5 +1,6 @@
+import { join } from 'path'
 import { createHash } from 'crypto'
-import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from 'fs'
+import { existsSync, mkdirSync, readdirSync, readFileSync, utimesSync, writeFileSync } from 'fs'
 import { Readable } from 'stream'
 import { describe, expect, it, vi } from 'vitest'
 import type { AppConfig } from '../config'
@@ -116,6 +117,9 @@ describe('CacheManager', () => {
     writeFileSync(stale, 'stale')
     writeFileSync(temporary, 'partial')
 
+    const longAgo = new Date(Date.now() - 2 * 60 * 60 * 1000)
+    utimesSync(stale, longAgo, longAgo) // sudah lama tidak dipakai playlist mana pun
+
     cache.cleanupUnused([downloaded.path!])
 
     expect(existsSync(downloaded.path!)).toBe(true)
@@ -204,12 +208,214 @@ describe('CacheManager review fixes', () => {
     writeFileSync(`${dir}/${ours}`, 'cache')
     const cache = new CacheManager(dir, config)
 
-    cache.cleanupUnused([])
+    cache.cleanupUnused([], { ignoreGrace: true })
     expect(readdirSync(dir)).toEqual(['notes.txt'])
 
     writeFileSync(`${dir}/${ours}`, 'cache lagi')
     cache.clear()
     expect(readdirSync(dir)).toEqual(['notes.txt'])
+    await cache.close()
+  })
+})
+
+describe('CacheManager orphan grace period', () => {
+  const ORPHAN = `content_5_${'d'.repeat(20)}.mp4`
+
+  function make(clock: { t: number }): { dir: string; cache: CacheManager } {
+    const dir = makeTempDir()
+    const cache = new CacheManager(dir, config, undefined, undefined, {
+      now: () => clock.t,
+      orphanGraceMs: 30 * 60_000
+    })
+    writeFileSync(`${dir}/${ORPHAN}`, 'data')
+    const when = new Date(clock.t)
+    utimesSync(`${dir}/${ORPHAN}`, when, when)
+    return { dir, cache }
+  }
+
+  it('keeps recent orphans until the grace period passes', async () => {
+    const clock = { t: Date.now() }
+    const { dir, cache } = make(clock)
+
+    cache.cleanupUnused([])
+    expect(existsSync(`${dir}/${ORPHAN}`)).toBe(true)
+
+    clock.t += 29 * 60_000
+    cache.cleanupUnused([])
+    expect(existsSync(`${dir}/${ORPHAN}`)).toBe(true)
+
+    clock.t += 2 * 60_000
+    cache.cleanupUnused([])
+    expect(existsSync(`${dir}/${ORPHAN}`)).toBe(false)
+    await cache.close()
+  })
+
+  it('ignoreGrace removes orphans immediately (low disk space, manual purge)', async () => {
+    const { dir, cache } = make({ t: Date.now() })
+    cache.cleanupUnused([], { ignoreGrace: true })
+    expect(existsSync(`${dir}/${ORPHAN}`)).toBe(false)
+    await cache.close()
+  })
+
+  it('touch restarts the grace period for files that were just used', async () => {
+    const clock = { t: Date.now() }
+    const { dir, cache } = make(clock)
+    clock.t += 3 * 60 * 60_000 // 3 jam kemudian file sudah "kadaluarsa"
+    cache.touch([`${dir}/${ORPHAN}`]) // ...tetapi baru saja dipakai playlist
+    cache.cleanupUnused([])
+    expect(existsSync(`${dir}/${ORPHAN}`)).toBe(true)
+    await cache.close()
+  })
+
+  it('resolveCachedFile only resolves existing cache-pattern names (no path tricks)', async () => {
+    const { dir, cache } = make({ t: Date.now() })
+    expect(cache.resolveCachedFile(ORPHAN)).toBe(join(dir, ORPHAN))
+    expect(cache.resolveCachedFile('../secret.txt')).toBeNull()
+    expect(cache.resolveCachedFile(`content_6_${'e'.repeat(20)}.mp4`)).toBeNull()
+    expect(cache.resolveCachedFile('notes.txt')).toBeNull()
+    await cache.close()
+  })
+})
+
+describe('CacheManager disk space and verification', () => {
+  const disk = (
+    free: number,
+    minFreeBytes = 1_000
+  ): ConstructorParameters<typeof CacheManager>[4] => ({
+    minFreeBytes,
+    diskSpaceFn: async () => ({ free, total: 100_000 })
+  })
+
+  it('refuses to download when the file would eat into the free-space reserve, without retrying', async () => {
+    const requester = vi.fn(async () => ({
+      statusCode: 200,
+      body: Readable.from([Buffer.alloc(10)])
+    }))
+    const dir = makeTempDir()
+    const cache = new CacheManager(dir, config, requester, undefined, disk(5_000))
+
+    const result = await cache.download(item({ file_size: 4_500 })) // 5.000 - 4.500 < cadangan 1.000
+
+    expect(result).toMatchObject({ ok: false, diskFull: true, released: false })
+    expect(result.error).toMatch(/ruang disk tidak cukup/)
+    expect(requester).toHaveBeenCalledTimes(1)
+    expect(readdirSync(dir)).toEqual([])
+    await cache.close()
+  })
+
+  it('uses Content-Length when the server did not announce file_size', async () => {
+    const requester = vi.fn(async () => ({
+      statusCode: 200,
+      body: Readable.from([Buffer.alloc(10)]),
+      headers: { 'content-length': '4500' }
+    }))
+    const cache = new CacheManager(makeTempDir(), config, requester, undefined, disk(5_000))
+    expect(await cache.download(item())).toMatchObject({ ok: false, diskFull: true })
+    await cache.close()
+  })
+
+  it('downloads normally when there is enough room', async () => {
+    const requester = vi.fn(async () => ({
+      statusCode: 200,
+      body: Readable.from([Buffer.from('ok')])
+    }))
+    const cache = new CacheManager(makeTempDir(), config, requester, undefined, disk(5_000))
+    expect(await cache.download(item({ file_size: 2 }))).toMatchObject({ ok: true })
+    await cache.close()
+  })
+
+  it('treats a write failure with ENOSPC as disk full, cleans the temp file, and does not retry', async () => {
+    const dir = makeTempDir()
+    const requester = vi.fn(async () => ({
+      statusCode: 200,
+      body: new Readable({
+        read() {
+          this.destroy(Object.assign(new Error('no space left on device'), { code: 'ENOSPC' }))
+        }
+      })
+    }))
+    const cache = new CacheManager(dir, config, requester, undefined, disk(1_000_000, 0))
+
+    const result = await cache.download(item())
+
+    expect(result).toMatchObject({ ok: false, diskFull: true })
+    expect(requester).toHaveBeenCalledTimes(1)
+    expect(readdirSync(dir).filter((n) => n.endsWith('.tmp'))).toEqual([])
+    await cache.close()
+  })
+
+  it('hasRoomFor honors the reserve; an unmeasurable disk counts as enough', async () => {
+    const cache = new CacheManager(makeTempDir(), config, undefined, undefined, disk(10_000, 3_000))
+    expect(await cache.hasRoomFor(7_000)).toBe(true)
+    expect(await cache.hasRoomFor(7_001)).toBe(false)
+    const unknown = new CacheManager(makeTempDir(), config, undefined, undefined, {
+      diskSpaceFn: async () => null
+    })
+    expect(await unknown.hasRoomFor(1e15)).toBe(true)
+    await cache.close()
+    await unknown.close()
+  })
+
+  it('verifyFile reports ok, missing, and corrupt (size or checksum)', async () => {
+    const dir = makeTempDir()
+    const cache = new CacheManager(dir, config)
+    const data = Buffer.from('isi file')
+    const path = join(dir, `content_1_${'a'.repeat(20)}.mp4`)
+    writeFileSync(path, data)
+
+    expect(await cache.verifyFile(path, { size: null, checksum: null })).toBe('ok')
+    expect(await cache.verifyFile(path, { size: data.length, checksum: checksum(data) })).toBe('ok')
+    expect(await cache.verifyFile(path, { size: data.length + 1, checksum: null })).toBe('corrupt')
+    expect(
+      await cache.verifyFile(path, { size: null, checksum: checksum(Buffer.from('lain')) })
+    ).toBe('corrupt')
+    expect(await cache.verifyFile(`${path}.hilang`, { size: null, checksum: null })).toBe('missing')
+    writeFileSync(path, '')
+    expect(await cache.verifyFile(path, { size: null, checksum: null })).toBe('corrupt')
+    await cache.close()
+  })
+
+  it('verifyFile cannot judge an invalid server checksum, so it does not condemn the file', async () => {
+    const dir = makeTempDir()
+    const cache = new CacheManager(dir, config)
+    const path = join(dir, `content_1_${'a'.repeat(20)}.mp4`)
+    writeFileSync(path, 'x')
+    expect(await cache.verifyFile(path, { size: null, checksum: 'bukan-hex' })).toBe('ok')
+    await cache.close()
+  })
+
+  it('stats counts only cache files (not temp or foreign files) and exposes the directory', async () => {
+    const dir = makeTempDir()
+    writeFileSync(join(dir, `content_1_${'a'.repeat(20)}.mp4`), 'aaaa')
+    writeFileSync(join(dir, `content_2_${'b'.repeat(20)}.png`), 'bb')
+    writeFileSync(join(dir, 'catatan.txt'), 'xxxxxxxxxx')
+    writeFileSync(join(dir, `content_3_${'c'.repeat(20)}.mp4.1234.tmp`), 'cccccc')
+    const cache = new CacheManager(dir, config)
+    const stats = cache.stats()
+    expect(stats.fileCount).toBe(2)
+    expect(stats.totalBytes).toBe(6)
+    expect(stats.files.map((f) => f.name).sort()).toEqual([
+      `content_1_${'a'.repeat(20)}.mp4`,
+      `content_2_${'b'.repeat(20)}.png`
+    ])
+    expect(cache.directory).toBe(dir)
+    await cache.close()
+  })
+
+  it('plannedPath matches the path the download uses, and isCachedBySize checks existence and size', async () => {
+    const data = Buffer.from('video')
+    const requester = vi.fn(async () => ({ statusCode: 200, body: Readable.from([data]) }))
+    const cache = new CacheManager(makeTempDir(), config, requester, undefined, {
+      minFreeBytes: 0,
+      diskSpaceFn: async () => null
+    })
+    const media = item({ file_size: data.length })
+    expect(cache.isCachedBySize(media)).toBe(false)
+    const result = await cache.download(media)
+    expect(cache.plannedPath(media)).toBe(result.path)
+    expect(cache.isCachedBySize(media)).toBe(true)
+    expect(cache.isCachedBySize(item({ file_size: data.length + 1 }))).toBe(false)
+    expect(cache.plannedPath(item({ content_url: 'http://[bad' }))).toBeNull()
     await cache.close()
   })
 })

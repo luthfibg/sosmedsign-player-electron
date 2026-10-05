@@ -241,3 +241,46 @@ describe('DeviceService.resetIdentity', () => {
     expect(diagnostics.snapshot()).toHaveLength(1) // hanya baris "Identitas device direset"
   })
 })
+
+describe('DeviceService.onRegistrationCleared', () => {
+  async function registered(
+    api: Partial<ApiClient>
+  ): Promise<ReturnType<typeof setup> & { reasons: string[] }> {
+    const ctx = setup({
+      activate: vi.fn().mockResolvedValue(
+        res(200, {
+          api_token: 'T',
+          venue_id: 1,
+          name: 'N',
+          slot_capacity: 20,
+          slot_duration_seconds: 15
+        })
+      ),
+      ...api
+    })
+    await ctx.service.activate('ABCD2345')
+    const reasons: string[] = []
+    ctx.service.onRegistrationCleared((reason) => reasons.push(reason))
+    return { ...ctx, reasons }
+  }
+
+  it('reports "released" after a confirmed release', async () => {
+    const ctx = await registered({ release: vi.fn().mockResolvedValue(res(200)) })
+    await ctx.service.release()
+    expect(ctx.reasons).toEqual(['released'])
+  })
+
+  it('reports "identity-reset" on identity reset', async () => {
+    const ctx = await registered({})
+    ctx.service.resetIdentity()
+    expect(ctx.reasons).toEqual(['identity-reset'])
+  })
+
+  it('reports the given reason when the sync service forgets the registration', async () => {
+    const ctx = await registered({})
+    ctx.service.forgetRegistration('credentials-invalid', 'token ditolak')
+    expect(ctx.reasons).toEqual(['credentials-invalid'])
+    expect(ctx.credentials.isRegistered()).toBe(false)
+    expect(ctx.credentials.getOrCreateDeviceCode()).toBe('device-uuid-1')
+  })
+})

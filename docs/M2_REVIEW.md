@@ -16,7 +16,9 @@ Tanggal: 1 Oktober 2026. Baseline: 63 tes lulus, typecheck dan build bersih. Set
 4. **Cache hanya menghapus file miliknya** (pola `content_{id}_{hash20}.{ext}`). Sebelumnya `cleanupUnused` dan `clear`
    menghapus semua isi folder, berbahaya begitu direktori cache bisa diatur pengguna (M4).
 
-## Perlu keputusan (mengubah perilaku Android yang terdokumentasi)
+## Keputusan A, B, C: disetujui dan DITERAPKAN (lihat docs/M3_NOTES.md)
+
+Ringkasan di bawah dipertahankan sebagai riwayat alasan.
 
 A. **Token ditolak (401/403 JSON) langsung melepas device dan menghapus seluruh cache.** Backend punya kode reissue
    untuk menerbitkan ulang token; setelah itu token lama ditolak, player menghapus semua konten, lalu harus mengunduh ulang

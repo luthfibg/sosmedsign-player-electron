@@ -15,6 +15,19 @@ export type ReleaseOutcome = { ok: true } | { ok: false; message: string }
 
 type StateListener = (state: DeviceStateDto) => void
 
+/**
+ * Mengapa registrasi lokal dihapus (menentukan data lokal mana yang ikut dihapus):
+ *  - released: pengguna melepas device dari menu (server sudah konfirmasi)  -> hapus playlist + cache
+ *  - identity-reset: pengguna mereset identitas (device_code baru)           -> hapus playlist + cache
+ *  - unregistered: server berulang kali menyatakan device tidak terdaftar    -> hapus playlist + cache
+ *  - credentials-invalid: token ditolak berulang padahal device masih terdaftar (mis. token diterbitkan ulang)
+ *    -> data DIPERTAHANKAN, supaya aktivasi ulang dengan kode reissue tidak mengunduh ulang semuanya
+ */
+export type RegistrationClearedReason =
+  'released' | 'identity-reset' | 'unregistered' | 'credentials-invalid'
+
+type ClearedListener = (reason: RegistrationClearedReason) => void
+
 const NETWORK_MESSAGE = 'Tidak dapat terhubung ke server. Periksa koneksi jaringan lalu coba lagi.'
 
 export function normalizeActivationCode(raw: string): string {
@@ -23,6 +36,7 @@ export function normalizeActivationCode(raw: string): string {
 
 export class DeviceService {
   private readonly listeners = new Set<StateListener>()
+  private readonly clearedListeners = new Set<ClearedListener>()
 
   constructor(
     private readonly api: ApiClient,
@@ -44,6 +58,14 @@ export class DeviceService {
     this.listeners.add(listener)
     return () => {
       this.listeners.delete(listener)
+    }
+  }
+
+  /** Dipanggil setiap registrasi lokal dihapus; sync service memakainya untuk berhenti dan membersihkan data. */
+  onRegistrationCleared(listener: ClearedListener): () => void {
+    this.clearedListeners.add(listener)
+    return () => {
+      this.clearedListeners.delete(listener)
     }
   }
 
@@ -154,7 +176,7 @@ export class DeviceService {
 
     const idempotent = [200, 401, 403, 404].includes(result.status)
     if (idempotent) {
-      this.forgetRegistration(`release (HTTP ${result.status})`)
+      this.forgetRegistration('released', `release (HTTP ${result.status})`)
       return { ok: true }
     }
     if (result.status === 422 && result.isApiMessage && result.message) {
@@ -164,10 +186,11 @@ export class DeviceService {
     return { ok: false, message: `Server membalas status ${result.status}. Coba lagi nanti.` }
   }
 
-  /** Hapus kredensial terdaftar tapi pertahankan device_code (release / token dicabut). */
-  forgetRegistration(reason: string): void {
+  /** Hapus kredensial terdaftar tapi pertahankan device_code. Pendengar menentukan data lokal mana yang ikut dihapus. */
+  forgetRegistration(reason: RegistrationClearedReason, detail: string): void {
     this.credentials.clearRegistration()
-    this.diagnostics.log(`Registrasi dihapus: ${reason}`)
+    this.diagnostics.log(`Registrasi dihapus (${reason}): ${detail}`)
+    this.emitCleared(reason)
     this.emit()
   }
 
@@ -176,7 +199,12 @@ export class DeviceService {
     this.credentials.resetIdentity()
     this.diagnostics.clear()
     this.diagnostics.log('Identitas device direset (device_code baru)')
+    this.emitCleared('identity-reset')
     this.emit()
+  }
+
+  private emitCleared(reason: RegistrationClearedReason): void {
+    for (const listener of this.clearedListeners) listener(reason)
   }
 
   private emit(): void {

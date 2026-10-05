@@ -58,6 +58,16 @@ export const MIGRATIONS: Migration[] = [
         was_offline INTEGER NOT NULL DEFAULT 0
       );
     `
+  },
+  {
+    version: 2,
+    description: 'app_state: pasangan key/value kecil (penghitung masa tenggang validasi/token)',
+    sql: `
+      CREATE TABLE app_state (
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL
+      );
+    `
   }
 ]
 

@@ -1,9 +1,11 @@
-import { app, shell, BrowserWindow, net } from 'electron'
+import { app, shell, BrowserWindow, net, powerSaveBlocker, protocol } from 'electron'
 import { join } from 'path'
 import { electronApp, optimizer, is } from '@electron-toolkit/utils'
 import icon from '../../resources/icon.png?asset'
 import { loadConfig } from './config'
 import { openDatabase, type Db } from './db/database'
+import { SqlitePlaybackLogStore } from './db/playback-log-store'
+import { SqlitePlaylistStore } from './db/sqlite-playlist-store'
 import { registerIpc } from './ipc/register-ipc'
 import { ApiClient } from './services/api-client'
 import { CredentialStore } from './services/credential-store'
@@ -11,7 +13,19 @@ import { DeviceService } from './services/device-service'
 import { Diagnostics } from './services/diagnostics'
 import { createSafeStorageCipher } from './services/electron-cipher'
 import { CacheManager } from './services/cache-manager'
+import { PlaybackReporter } from './services/playback-reporter'
+import { PlaybackStatus } from './services/playback-status'
 import { SyncService } from './services/sync-service'
+import { MEDIA_SCHEME, mediaUrlFor, serveMediaRequest } from './services/media-protocol'
+import { toPlayerPlaylist } from './services/playlist-presenter'
+
+// Protokol media harus didaftarkan SEBELUM app ready. Renderer memutar file cache lewat sosmedsign-media://media/<file>.
+protocol.registerSchemesAsPrivileged([
+  {
+    scheme: MEDIA_SCHEME,
+    privileges: { standard: true, secure: true, supportFetchAPI: true, stream: true }
+  }
+])
 
 // Video/gambar harus bisa autoplay tanpa interaksi pengguna (signage tanpa keyboard/mouse).
 app.commandLine.appendSwitch('autoplay-policy', 'no-user-gesture-required')
@@ -22,6 +36,8 @@ let apiClient: ApiClient | null = null
 let disposeIpc: (() => void) | null = null
 let syncService: SyncService | null = null
 let unsubscribeDeviceState: (() => void) | null = null
+let unsubscribeCleared: (() => void) | null = null
+let powerSaveBlockerId: number | null = null
 
 function createWindow(): void {
   mainWindow = new BrowserWindow({
@@ -38,6 +54,8 @@ function createWindow(): void {
       preload: join(__dirname, '../preload/index.js'),
       sandbox: false,
       contextIsolation: true,
+      // Pemutaran tidak boleh melambat saat jendela dianggap tersembunyi/tertutup.
+      backgroundThrottling: false,
       nodeIntegration: false
     }
   })
@@ -103,29 +121,54 @@ if (!app.requestSingleInstanceLock()) {
       undefined,
       (message) => diagnostics.log(message)
     )
+    const playlistStore = new SqlitePlaylistStore(db)
+    const playbackStatus = new PlaybackStatus()
+    const playbackReporter = new PlaybackReporter({
+      store: new SqlitePlaybackLogStore(db),
+      api: apiClient,
+      isOnline: () => net.isOnline(),
+      log: (message) => diagnostics.log(message)
+    })
     syncService = new SyncService(
-      db,
+      playlistStore,
       apiClient,
       deviceService,
       credentials,
       cacheManager,
       diagnostics,
-      { isOnline: () => net.isOnline() }
+      { isOnline: () => net.isOnline(), reporter: playbackReporter }
     )
     const wasRegistered = deviceService.getState().registered
+    // Registrasi dihapus: hentikan sync; data lokal dihapus atau dipertahankan sesuai alasannya.
+    unsubscribeCleared = deviceService.onRegistrationCleared((reason) => {
+      syncService?.handleRegistrationCleared(reason)
+      playbackStatus.reset()
+    })
+    // Aktivasi berhasil: mulai sync tanpa perlu restart.
     unsubscribeDeviceState = deviceService.onStateChange((state) => {
-      if (state.registered) {
-        syncService?.start()
-      } else {
-        syncService?.clearLocalData()
-      }
+      if (state.registered) syncService?.start()
     })
     if (wasRegistered) syncService.start()
+    protocol.handle(MEDIA_SCHEME, (request) =>
+      serveMediaRequest(request, (name) => cacheManager.resolveCachedFile(name))
+    )
+    // Layar tidak boleh mati/redup saat menayangkan konten (setara "Keep screen on" di Android).
+    powerSaveBlockerId = powerSaveBlocker.start('prevent-display-sleep')
+
+    const sync = syncService
     disposeIpc = registerIpc({
       deviceService,
       diagnostics,
-      syncService,
-      isOnline: () => net.isOnline()
+      syncService: sync,
+      isOnline: () => net.isOnline(),
+      getPlayerPlaylist: () => toPlayerPlaylist(playlistStore.getActivePlaylist(), mediaUrlFor),
+      onPlaylistChanged: (listener) => sync.onPlaylistChanged(listener),
+      recordPlayback: (event) => {
+        playbackReporter.record(event)
+        playbackStatus.noteActivity()
+      },
+      updatePlayerStatus: (status) => playbackStatus.update(status.state, status.label),
+      getPlaybackIndicator: () => playbackStatus.getIndicator()
     })
 
     createWindow()
@@ -138,6 +181,8 @@ if (!app.requestSingleInstanceLock()) {
   app.on('before-quit', () => {
     disposeIpc?.()
     unsubscribeDeviceState?.()
+    unsubscribeCleared?.()
+    if (powerSaveBlockerId !== null) powerSaveBlocker.stop(powerSaveBlockerId)
     void syncService?.close()
     void apiClient?.close()
     db?.close()

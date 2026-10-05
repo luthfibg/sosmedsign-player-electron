@@ -260,3 +260,44 @@ code {
     justify-content: flex-end;
   }
 }
+
+/* ---- layar pemutar ---- */
+.player {
+  position: fixed;
+  inset: 0;
+  overflow: hidden;
+  background: #000;
+  cursor: none;
+}
+
+.player .layer {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: contain; /* FIT: letterbox/pillarbox, tidak di-crop */
+  background: #000;
+  opacity: 0;
+}
+
+.splash {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  background: #000;
+  color: var(--muted);
+}
+
+.splash-title {
+  font-size: 32px;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.splash-sub {
+  font-size: 16px;
+}
