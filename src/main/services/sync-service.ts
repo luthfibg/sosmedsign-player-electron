@@ -178,7 +178,7 @@ export class SyncService {
    * Memeriksa semua file cache playlist aktif terhadap ukuran/checksum dari server. File hilang atau rusak ditandai
    * FAILED (file rusak dihapus), lalu langsung dicoba diunduh ulang lewat siklus sync berikutnya.
    */
-  async verifyAndRepair(): Promise<VerifyResult> {
+  async verifyAndRepair(options: { checksum?: boolean } = {}): Promise<VerifyResult> {
     const found = await this.runExclusive(async () => {
       const generation = this.generation
       const active = this.store.getActivePlaylist()
@@ -194,7 +194,7 @@ export class SyncService {
         if (!verdict) {
           verdict = await this.cache.verifyFile(path, {
             size: item.fileSize,
-            checksum: item.checksumSha256
+            checksum: options.checksum === false ? null : item.checksumSha256
           })
           verdicts.set(path, verdict)
           counts.checked++
@@ -620,4 +620,36 @@ function isPlaylistResponse(value: unknown): value is PlaylistResponse {
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
+}
+
+/** Ringkasan hasil sync untuk pengguna (menu Pengaturan dan log). */
+export function describeSyncOutcome(outcome: SyncOutcome): string {
+  switch (outcome) {
+    case 'applied':
+      return 'Playlist baru diterapkan.'
+    case 'partial':
+      return 'Playlist baru diterapkan, sebagian konten gagal diunduh.'
+    case 'not-modified':
+      return 'Playlist sudah yang terbaru.'
+    case 'no-playlist':
+      return 'CMS belum memiliki playlist untuk device ini.'
+    case 'offline':
+      return 'Tidak ada koneksi jaringan; sinkronisasi dilewati.'
+    case 'not-registered':
+      return 'Device belum terdaftar.'
+    case 'validation-grace':
+      return 'Validasi ke CMS belum berhasil; memutar dari cache.'
+    case 'auth-rejected':
+      return 'Token ditolak server; masa tenggang berjalan.'
+    case 'released':
+      return 'Registrasi device dilepas.'
+    case 'download-failed':
+      return 'Semua unduhan konten gagal.'
+    case 'error':
+      return 'Sinkronisasi gagal; lihat log diagnostik.'
+    case 'busy':
+      return 'Sinkronisasi sedang berjalan.'
+    case 'aborted':
+      return 'Sinkronisasi dibatalkan.'
+  }
 }

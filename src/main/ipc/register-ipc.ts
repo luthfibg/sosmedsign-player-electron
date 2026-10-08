@@ -3,7 +3,8 @@ import type { DeviceService } from '../services/device-service'
 import type { Diagnostics } from '../services/diagnostics'
 import type { SyncService } from '../services/sync-service'
 import { IPC } from './channels'
-import { isPlaybackEvent, isPlayerStatus } from './validators'
+import type { MaintenanceService } from '../services/maintenance-service'
+import { isCacheDirMode, isPathInput, isPlaybackEvent, isPlayerStatus } from './validators'
 
 interface IpcDeps {
   deviceService: DeviceService
@@ -17,6 +18,9 @@ interface IpcDeps {
   recordPlayback: (event: PlaybackEventDto) => void
   updatePlayerStatus: (status: PlayerStatusDto) => void
   getPlaybackIndicator: () => DiagnosticIndicatorDto
+  maintenance: MaintenanceService
+  /** Dialog pilih folder (null = dibatalkan). */
+  chooseDirectory: (defaultPath: string | null) => Promise<string | null>
 }
 
 /** Mendaftarkan handler IPC dan meneruskan perubahan state device ke semua jendela. Mengembalikan fungsi dispose. */
@@ -29,7 +33,9 @@ export function registerIpc({
   onPlaylistChanged,
   recordPlayback,
   updatePlayerStatus,
-  getPlaybackIndicator
+  getPlaybackIndicator,
+  maintenance,
+  chooseDirectory
 }: IpcDeps): () => void {
   ipcMain.handle(IPC.getDeviceState, (): DeviceStateDto => deviceService.getState())
 
@@ -53,6 +59,45 @@ export function registerIpc({
     }
   })
   ipcMain.handle(IPC.getPlaylist, (): PlayerPlaylistDto | null => getPlayerPlaylist())
+  ipcMain.handle(IPC.settingsOverview, (): Promise<SettingsOverviewDto> =>
+    maintenance.getOverview()
+  )
+  ipcMain.handle(IPC.chooseCacheDir, (_event, defaultPath: unknown): Promise<string | null> =>
+    chooseDirectory(isPathInput(defaultPath) ? defaultPath : null)
+  )
+  ipcMain.handle(IPC.previewCacheDir, (_event, path: unknown): CacheDirPreviewDto => {
+    if (!isPathInput(path)) {
+      return {
+        ok: false,
+        reason: 'Path folder tidak valid.',
+        isNew: false,
+        existingCacheFiles: 0,
+        currentFiles: 0,
+        currentBytes: 0
+      }
+    }
+    return maintenance.previewCacheDir(path)
+  })
+  ipcMain.handle(
+    IPC.changeCacheDir,
+    (
+      _event,
+      path: unknown,
+      mode: unknown
+    ): Promise<SettingsActionResultDto> | SettingsActionResultDto =>
+      isPathInput(path) && isCacheDirMode(mode)
+        ? maintenance.changeCacheDir(path, mode)
+        : { ok: false, message: 'Permintaan tidak valid.' }
+  )
+  ipcMain.handle(IPC.cleanCache, (): Promise<SettingsActionResultDto> => maintenance.cleanCache())
+  ipcMain.handle(IPC.verifyCache, (): Promise<SettingsActionResultDto> => maintenance.verifyCache())
+  ipcMain.handle(IPC.forceSync, (): Promise<SettingsActionResultDto> => maintenance.forceSync())
+  ipcMain.handle(IPC.setKeepScreenOn, (_event, on: unknown): void => {
+    if (typeof on === 'boolean') maintenance.setKeepScreenOn(on)
+  })
+  ipcMain.handle(IPC.releaseDevice, (): Promise<SettingsActionResultDto> =>
+    maintenance.releaseDevice()
+  )
   ipcMain.handle(IPC.itemCompleted, (_event, event: unknown): void => {
     if (isPlaybackEvent(event)) recordPlayback(event)
   })
@@ -87,6 +132,19 @@ export function registerIpc({
     ipcMain.removeHandler(IPC.getPlaylist)
     ipcMain.removeHandler(IPC.logPlayer)
     ipcMain.removeHandler(IPC.itemCompleted)
+    for (const channel of [
+      IPC.settingsOverview,
+      IPC.chooseCacheDir,
+      IPC.previewCacheDir,
+      IPC.changeCacheDir,
+      IPC.cleanCache,
+      IPC.verifyCache,
+      IPC.forceSync,
+      IPC.setKeepScreenOn,
+      IPC.releaseDevice
+    ]) {
+      ipcMain.removeHandler(channel)
+    }
     ipcMain.removeHandler(IPC.playerStatus)
   }
 }

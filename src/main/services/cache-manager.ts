@@ -3,23 +3,20 @@ import {
   createReadStream,
   createWriteStream,
   existsSync,
-  mkdirSync,
   readdirSync,
   renameSync,
   statSync,
   unlinkSync,
   utimesSync
 } from 'fs'
-import { statfs } from 'fs/promises'
-import { basename, dirname, extname, join, resolve } from 'path'
+import { copyFile, statfs } from 'fs/promises'
+import { basename, dirname, extname, join, resolve, sep } from 'path'
 import { Agent, request } from 'undici'
 import { Transform, type Readable } from 'stream'
 import { pipeline } from 'stream/promises'
 import type { AppConfig } from '../config'
 import type { PlaylistItemDto } from './api-types'
-
-/** Hanya file dengan nama ini yang dibuat dan boleh dihapus cache manager; file lain di folder tidak disentuh. */
-const CACHE_FILE_PATTERN = /^content_\d+_[0-9a-f]{20}\.[a-z0-9]{1,8}$/
+import { CACHE_FILE_PATTERN, prepareCacheDir, validateCacheDir } from './cache-dir'
 
 const DEFAULT_ORPHAN_GRACE_MS = 30 * 60 * 1000
 /** Ruang disk yang selalu disisakan: Windows dan log butuh ruang kerja, dan disk penuh membuat MiniPC tidak stabil. */
@@ -46,6 +43,24 @@ export interface DiskSpace {
 
 export type FileVerdict = 'ok' | 'missing' | 'corrupt'
 
+/** move = pindahkan file cache lama ke folder baru; fresh = mulai kosong (file lama dihapus, konten diunduh ulang). */
+export type CacheDirMode = 'move' | 'fresh'
+
+export interface RelocationResult {
+  newDir: string
+  moved: number
+  failed: number
+  /** Hanya mode fresh: file cache lama yang dihapus. */
+  removed: number
+}
+
+export interface CleanupResult {
+  deleted: number
+  freedBytes: number
+  /** Gagal dihapus (mis. sedang dipakai); dicoba lagi otomatis. */
+  deferred: number
+}
+
 export interface CacheManagerOptions {
   /** Cadangan ruang disk minimal (default 1 GiB). */
   minFreeBytes?: number
@@ -53,6 +68,13 @@ export interface CacheManagerOptions {
   /** File yang tidak lagi dipakai playlist baru dihapus setelah selang ini (default 30 menit). */
   orphanGraceMs?: number
   now?: () => number
+  /** Operasi file untuk pemindahan folder; diganti di tes untuk mensimulasikan beda drive (EXDEV). */
+  fileOps?: {
+    rename: (from: string, to: string) => void
+    copyFile: (from: string, to: string) => Promise<void>
+  }
+  /** Penentu dua folder berada di drive yang sama; diganti di tes untuk mensimulasikan drive berbeda. */
+  sameVolumeFn?: (a: string, b: string) => boolean
 }
 
 interface ContentResponse {
@@ -73,9 +95,11 @@ export class CacheManager {
   private readonly now: () => number
   private readonly minFreeBytes: number
   private readonly diskSpaceFn: (dir: string) => Promise<DiskSpace | null>
+  private readonly fileOps: NonNullable<CacheManagerOptions['fileOps']>
+  private readonly sameVolumeFn: (a: string, b: string) => boolean
 
   constructor(
-    private readonly cacheDir: string,
+    private cacheDir: string,
     private readonly config: AppConfig,
     requester?: ContentRequester,
     private readonly warn: (message: string) => void = () => {},
@@ -85,7 +109,12 @@ export class CacheManager {
     this.now = options.now ?? Date.now
     this.minFreeBytes = options.minFreeBytes ?? DEFAULT_MIN_FREE_BYTES
     this.diskSpaceFn = options.diskSpaceFn ?? defaultDiskSpace
-    mkdirSync(cacheDir, { recursive: true })
+    this.fileOps = options.fileOps ?? {
+      rename: renameSync,
+      copyFile: (from, to) => copyFile(from, to)
+    }
+    this.sameVolumeFn = options.sameVolumeFn ?? sameVolumeOnDisk
+    prepareCacheDir(cacheDir)
     this.removeStaleTempFiles()
     this.agent = new Agent({ connect: { timeout: config.connectTimeoutMs } })
     this.requestContent =
@@ -212,7 +241,11 @@ export class CacheManager {
    * (dihitung dari mtime = "terakhir direferensikan", lihat touch) kecuali ignoreGrace. File .tmp (unduhan
    * berjalan) dan file asing di folder tidak pernah disentuh.
    */
-  cleanupUnused(usedPaths: Iterable<string>, options: { ignoreGrace?: boolean } = {}): void {
+  cleanupUnused(
+    usedPaths: Iterable<string>,
+    options: { ignoreGrace?: boolean } = {}
+  ): CleanupResult {
+    const result: CleanupResult = { deleted: 0, freedBytes: 0, deferred: 0 }
     try {
       const keep = new Set([...usedPaths].map((path) => resolve(path)))
       const now = this.now()
@@ -228,11 +261,23 @@ export class CacheManager {
             continue // hilang sendiri
           }
         }
-        this.removeFile(file)
+        let size = 0
+        try {
+          size = statSync(file).size
+        } catch {
+          continue
+        }
+        if (this.removeFile(file)) {
+          result.deleted++
+          result.freedBytes += size
+        } else {
+          result.deferred++
+        }
       }
     } catch (error) {
       this.warn(`cleanup cache gagal: ${errorMessage(error)}`)
     }
+    return result
   }
 
   /**
@@ -350,6 +395,89 @@ export class CacheManager {
     this.removeFile(path)
   }
 
+  /**
+   * Memindahkan folder cache. HARUS dipanggil saat tidak ada unduhan berjalan (dalam SyncService.runExclusive).
+   * Semua pemeriksaan dilakukan sebelum ada yang berubah: kalau melempar Error, folder lama tetap dipakai utuh.
+   * Setelah folder berganti, file yang gagal dipindahkan akan terdeteksi hilang oleh verifikasi cache dan diunduh ulang.
+   */
+  async changeDirectory(newDirInput: string, mode: CacheDirMode): Promise<RelocationResult> {
+    const next = resolve(newDirInput)
+    const current = resolve(this.cacheDir)
+    const compare = (value: string): string =>
+      process.platform === 'win32' ? value.toLowerCase() : value
+
+    if (compare(next) === compare(current)) {
+      throw new Error('Folder tujuan sama dengan folder cache saat ini.')
+    }
+    if (
+      compare(next).startsWith(compare(current) + sep) ||
+      compare(current).startsWith(compare(next) + sep)
+    ) {
+      throw new Error(
+        'Folder tujuan tidak boleh berada di dalam (atau membungkus) folder cache saat ini.'
+      )
+    }
+    const check = validateCacheDir(next)
+    if (!check.ok) throw new Error(check.reason)
+    prepareCacheDir(next)
+
+    const source = this.stats()
+    if (mode === 'move' && source.totalBytes > 0 && !this.sameVolumeFn(current, next)) {
+      const space = await this.diskSpaceFn(next)
+      if (space && space.free - source.totalBytes < this.minFreeBytes) {
+        throw new Error(
+          `Ruang di folder tujuan tidak cukup (butuh ${formatBytes(source.totalBytes)}, kosong ${formatBytes(space.free)}).`
+        )
+      }
+    }
+
+    let moved = 0
+    let failed = 0
+    let removed = 0
+    for (const file of source.files) {
+      const from = join(current, file.name)
+      if (mode === 'fresh') {
+        if (this.removeFile(from)) removed++
+        continue
+      }
+      try {
+        await this.moveFile(from, join(next, file.name))
+        moved++
+      } catch (error) {
+        failed++
+        this.warn(`gagal memindahkan ${file.name}: ${errorMessage(error)}`)
+      }
+    }
+
+    this.cacheDir = next
+    this.warn(
+      `folder cache dipindah ke ${next} (${moved} dipindahkan, ${failed} gagal, ${removed} dihapus)`
+    )
+    return { newDir: next, moved, failed, removed }
+  }
+
+  /** Rename kalau satu drive; kalau tidak (EXDEV) salin ke .tmp, cocokkan ukuran, rename, lalu hapus sumber. */
+  private async moveFile(from: string, to: string): Promise<void> {
+    if (existsSync(to)) unlinkSync(to) // sisa lama dengan nama sama
+    try {
+      this.fileOps.rename(from, to)
+      return
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'EXDEV') throw error
+    }
+    const staging = `${to}.moving.tmp`
+    try {
+      await this.fileOps.copyFile(from, staging)
+      if (statSync(staging).size !== statSync(from).size)
+        throw new Error('ukuran salinan tidak cocok')
+      renameSync(staging, to)
+    } catch (error) {
+      this.removeFile(staging)
+      throw error
+    }
+    this.removeFile(from)
+  }
+
   /** Hapus cache saat device dilepas; kegagalan penghapusan dicoba ulang pada cleanup berikutnya. */
   clear(): void {
     try {
@@ -409,10 +537,11 @@ export class CacheManager {
     }
   }
 
-  private removeFile(file: string): void {
+  private removeFile(file: string): boolean {
     try {
       if (existsSync(file)) unlinkSync(file)
       this.pendingDelete.delete(file)
+      return true
     } catch (error) {
       this.pendingDelete.add(file)
       this.warn(`cache menunggu penghapusan: ${basename(file)} (${errorMessage(error)})`)
@@ -423,6 +552,7 @@ export class CacheManager {
         )
         this.deleteRetryTimer.unref()
       }
+      return false
     }
   }
 
@@ -432,6 +562,14 @@ export class CacheManager {
       clearInterval(this.deleteRetryTimer)
       this.deleteRetryTimer = null
     }
+  }
+}
+
+function sameVolumeOnDisk(a: string, b: string): boolean {
+  try {
+    return statSync(a).dev === statSync(b).dev
+  } catch {
+    return false
   }
 }
 

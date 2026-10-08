@@ -18,3 +18,17 @@ export function isPlayerStatus(value: unknown): value is PlayerStatusDto {
     (s.label === undefined || s.label === null || typeof s.label === 'string')
   )
 }
+
+export function isCacheDirMode(value: unknown): value is CacheDirModeDto {
+  return value === 'move' || value === 'fresh'
+}
+
+/** Path dari renderer: string berisi, panjang wajar, tanpa karakter NUL. */
+export function isPathInput(value: unknown): value is string {
+  return (
+    typeof value === 'string' &&
+    value.trim().length > 0 &&
+    value.length <= 1024 &&
+    !value.includes('\0')
+  )
+}

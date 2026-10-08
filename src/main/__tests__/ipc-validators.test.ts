@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { isPlaybackEvent, isPlayerStatus } from '../ipc/validators'
+import { isCacheDirMode, isPathInput, isPlaybackEvent, isPlayerStatus } from '../ipc/validators'
 
 const valid = {
   contentId: 7,
@@ -43,6 +43,38 @@ describe('isPlayerStatus', () => {
   it('rejects unknown states and wrong label types', () => {
     for (const bad of [null, 'playing', {}, { state: 'paused' }, { state: 'playing', label: 5 }]) {
       expect(isPlayerStatus(bad)).toBe(false)
+    }
+  })
+})
+
+describe('isCacheDirMode', () => {
+  it('accepts only the two supported modes', () => {
+    expect(isCacheDirMode('move')).toBe(true)
+    expect(isCacheDirMode('fresh')).toBe(true)
+    for (const bad of ['MOVE', 'copy', '', null, undefined, 1, {}])
+      expect(isCacheDirMode(bad)).toBe(false)
+  })
+})
+
+describe('isPathInput', () => {
+  it('accepts ordinary non-empty paths', () => {
+    expect(isPathInput('D:\\SosmedSignCache')).toBe(true)
+    expect(isPathInput('/mnt/media/cache')).toBe(true)
+  })
+
+  it('rejects blank, oversized, NUL-containing, and non-string input', () => {
+    for (const bad of [
+      '',
+      '   ',
+      'x'.repeat(1025),
+      'D:\\cache\0evil',
+      null,
+      undefined,
+      42,
+      {},
+      []
+    ]) {
+      expect(isPathInput(bad)).toBe(false)
     }
   })
 })

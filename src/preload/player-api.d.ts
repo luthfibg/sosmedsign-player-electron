@@ -56,6 +56,56 @@ declare global {
     label?: string | null
   }
 
+  interface SettingsOverviewDto {
+    device: {
+      registered: boolean
+      deviceCode: string
+      deviceName: string | null
+      venueId: number | null
+    }
+    app: { version: string; electron: string; backendUrl: string }
+    system: { appBytes: number; systemTotalBytes: number; systemFreeBytes: number }
+    storage: {
+      cacheDir: string
+      cacheFiles: number
+      cacheBytes: number
+      orphanFiles: number
+      orphanBytes: number
+      diskFreeBytes: number | null
+      diskTotalBytes: number | null
+      dbBytes: number
+      itemsTotal: number
+      itemsReady: number
+      itemsFailed: number
+      pendingPlaybackLogs: number
+    }
+    sync: DiagnosticIndicatorDto
+    settings: {
+      keepScreenOn: boolean
+      /** Folder cache khusus yang diatur pengguna (null = bawaan). */
+      customCacheDir: string | null
+      defaultCacheDir: string
+      /** Folder khusus tidak bisa dipakai saat startup, jadi sesi ini memakai folder bawaan. */
+      cacheDirFallbackReason: string | null
+    }
+  }
+
+  interface CacheDirPreviewDto {
+    ok: boolean
+    reason: string | null
+    isNew: boolean
+    existingCacheFiles: number
+    currentFiles: number
+    currentBytes: number
+  }
+
+  interface SettingsActionResultDto {
+    ok: boolean
+    message: string
+  }
+
+  type CacheDirModeDto = 'move' | 'fresh'
+
   type ActivationResultDto = { ok: true } | { ok: false; message: string }
 
   type DiagnosticIndicatorState =
@@ -87,6 +137,16 @@ declare global {
     reportItemCompleted(event: PlaybackEventDto): Promise<void>
     /** Melaporkan status mesin pemutar (untuk lampu Playback di panel diagnostik). */
     reportPlayerStatus(status: PlayerStatusDto): Promise<void>
+    getSettingsOverview(): Promise<SettingsOverviewDto>
+    /** Dialog pilih folder (null = dibatalkan). */
+    chooseCacheDir(defaultPath: string | null): Promise<string | null>
+    previewCacheDir(path: string): Promise<CacheDirPreviewDto>
+    changeCacheDir(path: string, mode: CacheDirModeDto): Promise<SettingsActionResultDto>
+    cleanCache(): Promise<SettingsActionResultDto>
+    verifyCache(): Promise<SettingsActionResultDto>
+    forceSync(): Promise<SettingsActionResultDto>
+    setKeepScreenOn(on: boolean): Promise<void>
+    releaseDevice(): Promise<SettingsActionResultDto>
     onPlaylistChanged(callback: (playlist: PlayerPlaylistDto | null) => void): () => void
     /** Mengembalikan fungsi untuk berhenti berlangganan. */
     onDeviceStateChanged(callback: (state: DeviceStateDto) => void): () => void

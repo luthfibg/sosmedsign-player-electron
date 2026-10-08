@@ -9,7 +9,7 @@ import type { ApiClient } from '../services/api-client'
 import { CacheManager } from '../services/cache-manager'
 import type { CredentialStore } from '../services/credential-store'
 import type { DeviceService, RegistrationValidation } from '../services/device-service'
-import { SyncService } from '../services/sync-service'
+import { SyncService, describeSyncOutcome, type SyncOutcome } from '../services/sync-service'
 import { makeTempDir, registerTempDirCleanup } from './helpers'
 import { MemoryPlaylistStore } from './memory-store'
 
@@ -898,5 +898,52 @@ describe('verifyAndRepair', () => {
     ctx.reply.status = 204
     expect((await ctx.service.verifyAndRepair()).checked).toBe(1)
     await ctx.cache.close()
+  })
+})
+
+describe('verifyAndRepair without checksums (after moving the cache folder)', () => {
+  it('only checks existence and size, so a same-size corrupt file passes but a missing one is repaired', async () => {
+    const text = 'isi-asli'
+    const sha = createHash('sha256').update(text).digest('hex')
+    const ctx = setup({ requester: async () => okBody(text) })
+    ctx.reply.status = 200
+    ctx.reply.json = response([
+      { ...dto(1), file_size: Buffer.byteLength(text), checksum_sha256: sha },
+      { ...dto(2), file_size: Buffer.byteLength(text), checksum_sha256: sha }
+    ])
+    await ctx.service.syncOnce()
+    const [first, second] = ctx.store.getActivePlaylist()!.items
+    writeFileSync(join(ctx.cacheDir, first.localFile!), 'RUSAK!!!') // ukuran sama (8 byte)
+    unlinkSync(join(ctx.cacheDir, second.localFile!))
+    ctx.reply.status = 204
+
+    const result = await ctx.service.verifyAndRepair({ checksum: false })
+
+    expect(result).toMatchObject({ checked: 2, corrupt: 0, missing: 1, stillFailed: 0 })
+    expect(readFileSync(join(ctx.cacheDir, first.localFile!), 'utf8')).toBe('RUSAK!!!') // tidak diperiksa isinya
+    await ctx.cache.close()
+  })
+})
+
+describe('describeSyncOutcome', () => {
+  it('has a readable message for every outcome', () => {
+    const outcomes: SyncOutcome[] = [
+      'applied',
+      'not-modified',
+      'no-playlist',
+      'offline',
+      'not-registered',
+      'validation-grace',
+      'auth-rejected',
+      'released',
+      'download-failed',
+      'partial',
+      'error',
+      'busy',
+      'aborted'
+    ]
+    const messages = outcomes.map(describeSyncOutcome)
+    expect(messages.every((m) => m.length > 8 && m.endsWith('.'))).toBe(true)
+    expect(new Set(messages).size).toBe(outcomes.length)
   })
 })

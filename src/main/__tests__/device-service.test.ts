@@ -99,11 +99,25 @@ describe('DeviceService.activate', () => {
   })
 
   it('jaringan gagal: pesan ramah, tidak terdaftar', async () => {
-    const activate = vi.fn().mockRejectedValue(new ApiNetworkError('ECONNREFUSED'))
+    const activate = vi
+      .fn()
+      .mockRejectedValue(new ApiNetworkError('ECONNREFUSED: connect ECONNREFUSED 192.168.1.46:80'))
     const { service, credentials } = setup({ activate })
     const r = await service.activate('ABCD2345')
     expect(r).toMatchObject({ ok: false, reason: 'network' })
     expect(credentials.isRegistered()).toBe(false)
+  })
+
+  it('jaringan gagal: pesan menyebut penyebab teknis (alamat dan kode error) untuk pemasang', async () => {
+    const activate = vi
+      .fn()
+      .mockRejectedValue(new ApiNetworkError('ECONNREFUSED: connect ECONNREFUSED 192.168.1.46:80'))
+    const { service } = setup({ activate })
+    const r = await service.activate('ABCD2345')
+    expect(r).toMatchObject({ ok: false })
+    expect((r as { message: string }).message).toContain('Periksa koneksi jaringan')
+    expect((r as { message: string }).message).toContain('ECONNREFUSED')
+    expect((r as { message: string }).message).toContain('192.168.1.46:80')
   })
 
   it('200 tanpa api_token ditolak', async () => {

@@ -87,8 +87,14 @@ export class DeviceService {
     try {
       result = await this.api.activate(code, deviceCode)
     } catch (error) {
-      this.diagnostics.log(`Aktivasi gagal (jaringan): ${(error as Error).message}`)
-      return { ok: false, reason: 'network', message: NETWORK_MESSAGE }
+      const detail = (error as Error).message
+      this.diagnostics.log(`Aktivasi gagal (jaringan): ${detail}`)
+      // Sebutkan penyebab teknisnya (mis. ECONNREFUSED 192.168.1.46:80) supaya pemasang tidak perlu membuka log.
+      return {
+        ok: false,
+        reason: 'network',
+        message: `${NETWORK_MESSAGE} (${detail.slice(0, 160)})`
+      }
     }
 
     if (result.status === 200) {

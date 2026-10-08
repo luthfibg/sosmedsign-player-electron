@@ -1,4 +1,4 @@
-import { join } from 'path'
+import { dirname, join } from 'path'
 import { createHash } from 'crypto'
 import { existsSync, mkdirSync, readdirSync, readFileSync, utimesSync, writeFileSync } from 'fs'
 import { Readable } from 'stream'
@@ -6,7 +6,11 @@ import { describe, expect, it, vi } from 'vitest'
 import type { AppConfig } from '../config'
 import type { PlaylistItemDto } from '../services/api-types'
 import { CacheManager } from '../services/cache-manager'
+import { CACHE_MARKER_FILE, prepareCacheDir } from '../services/cache-dir'
 import { makeTempDir, registerTempDirCleanup } from './helpers'
+
+/** Isi folder tanpa penanda .sosmedsign-cache (penanda ditulis cache manager sendiri). */
+const listing = (dir: string): string[] => readdirSync(dir).filter((n) => n !== CACHE_MARKER_FILE)
 
 registerTempDirCleanup()
 
@@ -197,7 +201,7 @@ describe('CacheManager review fixes', () => {
     mkdirSync(dir, { recursive: true })
     writeFileSync(`${dir}/content_17_${'a'.repeat(20)}.mp4.1234.tmp`, 'setengah')
     const cache = new CacheManager(dir, config)
-    expect(readdirSync(dir)).toEqual([])
+    expect(listing(dir)).toEqual([])
     await cache.close()
   })
 
@@ -209,11 +213,11 @@ describe('CacheManager review fixes', () => {
     const cache = new CacheManager(dir, config)
 
     cache.cleanupUnused([], { ignoreGrace: true })
-    expect(readdirSync(dir)).toEqual(['notes.txt'])
+    expect(listing(dir)).toEqual(['notes.txt'])
 
     writeFileSync(`${dir}/${ours}`, 'cache lagi')
     cache.clear()
-    expect(readdirSync(dir)).toEqual(['notes.txt'])
+    expect(listing(dir)).toEqual(['notes.txt'])
     await cache.close()
   })
 })
@@ -299,7 +303,7 @@ describe('CacheManager disk space and verification', () => {
     expect(result).toMatchObject({ ok: false, diskFull: true, released: false })
     expect(result.error).toMatch(/ruang disk tidak cukup/)
     expect(requester).toHaveBeenCalledTimes(1)
-    expect(readdirSync(dir)).toEqual([])
+    expect(listing(dir)).toEqual([])
     await cache.close()
   })
 
@@ -416,6 +420,189 @@ describe('CacheManager disk space and verification', () => {
     expect(cache.isCachedBySize(media)).toBe(true)
     expect(cache.isCachedBySize(item({ file_size: data.length + 1 }))).toBe(false)
     expect(cache.plannedPath(item({ content_url: 'http://[bad' }))).toBeNull()
+    await cache.close()
+  })
+})
+
+describe('CacheManager relocation', () => {
+  const A = `content_1_${'a'.repeat(20)}.mp4`
+  const B = `content_2_${'b'.repeat(20)}.png`
+
+  function seeded(options: ConstructorParameters<typeof CacheManager>[4] = {}): {
+    oldDir: string
+    newDir: string
+    cache: CacheManager
+  } {
+    const oldDir = join(makeTempDir(), 'lama')
+    const newDir = join(makeTempDir(), 'baru')
+    const cache = new CacheManager(oldDir, config, undefined, undefined, {
+      minFreeBytes: 0,
+      diskSpaceFn: async () => null,
+      ...options
+    })
+    writeFileSync(join(oldDir, A), 'video-bytes')
+    writeFileSync(join(oldDir, B), 'png')
+    writeFileSync(join(oldDir, 'catatan.txt'), 'milik pengguna')
+    return { oldDir, newDir, cache }
+  }
+
+  it('writes the ownership marker into every cache folder it uses', async () => {
+    const { oldDir, cache } = seeded()
+    expect(readdirSync(oldDir)).toContain(CACHE_MARKER_FILE)
+    await cache.close()
+  })
+
+  it('move: transfers cache files, leaves foreign files, and starts using the new folder', async () => {
+    const { oldDir, newDir, cache } = seeded()
+
+    const result = await cache.changeDirectory(newDir, 'move')
+
+    expect(result).toEqual({ newDir, moved: 2, failed: 0, removed: 0 })
+    expect(readdirSync(newDir).sort()).toEqual([A, B, CACHE_MARKER_FILE].sort())
+    expect(readFileSync(join(newDir, A), 'utf8')).toBe('video-bytes')
+    expect(listing(oldDir)).toEqual(['catatan.txt'])
+    expect(cache.directory).toBe(newDir)
+    expect(cache.resolveCachedFile(A)).toBe(join(newDir, A))
+    expect(cache.stats().fileCount).toBe(2)
+    await cache.close()
+  })
+
+  it('fresh: deletes the old cache files and leaves the new folder empty', async () => {
+    const { oldDir, newDir, cache } = seeded()
+
+    const result = await cache.changeDirectory(newDir, 'fresh')
+
+    expect(result).toEqual({ newDir, moved: 0, failed: 0, removed: 2 })
+    expect(listing(newDir)).toEqual([])
+    expect(listing(oldDir)).toEqual(['catatan.txt'])
+    expect(cache.directory).toBe(newDir)
+    await cache.close()
+  })
+
+  it('downloads after the change go to the new folder', async () => {
+    const requester = vi.fn(async () => ({
+      statusCode: 200,
+      body: Readable.from([Buffer.from('baru')])
+    }))
+    const { newDir, cache } = seeded({ minFreeBytes: 0, diskSpaceFn: async () => null })
+    const media = item()
+    await cache.changeDirectory(newDir, 'move')
+    const other = new CacheManager(newDir, config, requester, undefined, {
+      minFreeBytes: 0,
+      diskSpaceFn: async () => null
+    })
+    const result = await other.download(media)
+    expect(result.path?.startsWith(newDir)).toBe(true)
+    await cache.close()
+    await other.close()
+  })
+
+  it('refuses the same folder and nested folders without changing anything', async () => {
+    const { oldDir, cache } = seeded()
+    await expect(cache.changeDirectory(oldDir, 'move')).rejects.toThrow(/sama/)
+    await expect(cache.changeDirectory(join(oldDir, 'dalam'), 'move')).rejects.toThrow(/di dalam/)
+    await expect(cache.changeDirectory(dirname(oldDir), 'move')).rejects.toThrow(
+      /di dalam|membungkus|home|root/
+    )
+    expect(cache.directory).toBe(oldDir)
+    expect(listing(oldDir).sort()).toEqual([A, B, 'catatan.txt'].sort())
+    await cache.close()
+  })
+
+  it('refuses a destination that is not a SosmedSign cache and leaves the old folder intact', async () => {
+    const { oldDir, cache } = seeded()
+    const foreign = makeTempDir()
+    writeFileSync(join(foreign, 'dokumen.docx'), 'x')
+    await expect(cache.changeDirectory(foreign, 'move')).rejects.toThrow(/bukan folder cache/)
+    expect(cache.directory).toBe(oldDir)
+    expect(listing(oldDir)).toContain(A)
+    await cache.close()
+  })
+
+  it('checks free space on a different drive before moving anything', async () => {
+    const { oldDir, newDir, cache } = seeded({
+      minFreeBytes: 1_000,
+      diskSpaceFn: async () => ({ free: 1_005, total: 10_000 }),
+      sameVolumeFn: () => false
+    })
+    await expect(cache.changeDirectory(newDir, 'move')).rejects.toThrow(
+      /Ruang di folder tujuan tidak cukup/
+    )
+    expect(cache.directory).toBe(oldDir)
+    expect(listing(oldDir)).toContain(A)
+    expect(listing(newDir)).toEqual([]) // belum ada yang dipindahkan
+    await cache.close()
+  })
+
+  it('skips the free-space check on the same drive (rename needs no extra space)', async () => {
+    const { newDir, cache } = seeded({
+      minFreeBytes: 1_000,
+      diskSpaceFn: async () => ({ free: 10, total: 10_000 }),
+      sameVolumeFn: () => true
+    })
+    await expect(cache.changeDirectory(newDir, 'move')).resolves.toMatchObject({ moved: 2 })
+    await cache.close()
+  })
+
+  it('falls back to copy + verify + delete when rename crosses drives (EXDEV)', async () => {
+    const { oldDir, newDir, cache } = seeded({
+      fileOps: {
+        rename: () => {
+          throw Object.assign(new Error('cross-device link not permitted'), { code: 'EXDEV' })
+        },
+        copyFile: async (from, to) => {
+          writeFileSync(to, readFileSync(from))
+        }
+      }
+    })
+
+    const result = await cache.changeDirectory(newDir, 'move')
+
+    expect(result).toMatchObject({ moved: 2, failed: 0 })
+    expect(readFileSync(join(newDir, A), 'utf8')).toBe('video-bytes')
+    expect(listing(oldDir)).toEqual(['catatan.txt'])
+    expect(readdirSync(newDir).filter((n) => n.endsWith('.tmp'))).toEqual([])
+    await cache.close()
+  })
+
+  it('counts a failed copy, keeps the source file, cleans the staging file, and still switches folders', async () => {
+    const { oldDir, newDir, cache } = seeded({
+      fileOps: {
+        rename: () => {
+          throw Object.assign(new Error('xdev'), { code: 'EXDEV' })
+        },
+        copyFile: async (from, to) => {
+          if (from.endsWith(A)) {
+            writeFileSync(to, 'setengah')
+            throw new Error('disk penuh')
+          }
+          writeFileSync(to, readFileSync(from))
+        }
+      }
+    })
+
+    const result = await cache.changeDirectory(newDir, 'move')
+
+    expect(result).toMatchObject({ moved: 1, failed: 1 })
+    expect(listing(oldDir)).toContain(A) // sumber tidak hilang
+    expect(readdirSync(newDir).filter((n) => n.endsWith('.tmp'))).toEqual([])
+    expect(cache.directory).toBe(newDir)
+    await cache.close()
+  })
+
+  it('replaces a stale file with the same name in the destination', async () => {
+    const { newDir, cache } = seeded()
+    prepareCacheDir(newDir)
+    writeFileSync(join(newDir, A), 'sisa-lama')
+    await cache.changeDirectory(newDir, 'move')
+    expect(readFileSync(join(newDir, A), 'utf8')).toBe('video-bytes')
+    await cache.close()
+  })
+
+  it('cleanupUnused reports what it deleted', async () => {
+    const { oldDir, cache } = seeded()
+    const result = cache.cleanupUnused([join(oldDir, A)], { ignoreGrace: true })
+    expect(result).toEqual({ deleted: 1, freedBytes: 3, deferred: 0 }) // hanya B (3 byte) yang yatim
     await cache.close()
   })
 })

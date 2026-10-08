@@ -1,4 +1,5 @@
-import { app, shell, BrowserWindow, net, powerSaveBlocker, protocol } from 'electron'
+import { app, shell, BrowserWindow, dialog, net, powerSaveBlocker, protocol } from 'electron'
+import { totalmem, freemem } from 'os'
 import { join } from 'path'
 import { electronApp, optimizer, is } from '@electron-toolkit/utils'
 import icon from '../../resources/icon.png?asset'
@@ -12,7 +13,11 @@ import { CredentialStore } from './services/credential-store'
 import { DeviceService } from './services/device-service'
 import { Diagnostics } from './services/diagnostics'
 import { createSafeStorageCipher } from './services/electron-cipher'
+import { chooseCacheDir } from './services/cache-dir'
 import { CacheManager } from './services/cache-manager'
+import { MaintenanceService } from './services/maintenance-service'
+import { SettingsStore } from './services/settings-store'
+import { StorageStats } from './services/storage-stats'
 import { PlaybackReporter } from './services/playback-reporter'
 import { PlaybackStatus } from './services/playback-status'
 import { SyncService } from './services/sync-service'
@@ -115,11 +120,18 @@ if (!app.requestSingleInstanceLock()) {
     )
     apiClient = new ApiClient(config)
     const deviceService = new DeviceService(apiClient, credentials, diagnostics)
-    const cacheManager = new CacheManager(
-      join(userData, 'content_cache'),
-      config,
-      undefined,
-      (message) => diagnostics.log(message)
+    const settings = new SettingsStore(join(userData, 'settings.json'), (message) =>
+      diagnostics.log(message)
+    )
+    const defaultCacheDir = join(userData, 'content_cache')
+    const chosenCacheDir = chooseCacheDir(settings.get().cacheDir, defaultCacheDir)
+    if (chosenCacheDir.fallbackReason) {
+      diagnostics.log(
+        `Folder cache khusus tidak bisa dipakai (${chosenCacheDir.fallbackReason}); memakai folder bawaan`
+      )
+    }
+    const cacheManager = new CacheManager(chosenCacheDir.dir, config, undefined, (message) =>
+      diagnostics.log(message)
     )
     const playlistStore = new SqlitePlaylistStore(db)
     const playbackStatus = new PlaybackStatus()
@@ -152,10 +164,43 @@ if (!app.requestSingleInstanceLock()) {
     protocol.handle(MEDIA_SCHEME, (request) =>
       serveMediaRequest(request, (name) => cacheManager.resolveCachedFile(name))
     )
-    // Layar tidak boleh mati/redup saat menayangkan konten (setara "Keep screen on" di Android).
-    powerSaveBlockerId = powerSaveBlocker.start('prevent-display-sleep')
+    // Layar tidak boleh mati/redup saat menayangkan konten (setara "Keep screen on" di Android); bisa dimatikan di Pengaturan.
+    const applyKeepScreenOn = (on: boolean): void => {
+      if (on && powerSaveBlockerId === null) {
+        powerSaveBlockerId = powerSaveBlocker.start('prevent-display-sleep')
+      } else if (!on && powerSaveBlockerId !== null) {
+        powerSaveBlocker.stop(powerSaveBlockerId)
+        powerSaveBlockerId = null
+      }
+    }
+    applyKeepScreenOn(settings.get().keepScreenOn)
 
     const sync = syncService
+    const maintenance = new MaintenanceService({
+      cache: cacheManager,
+      store: playlistStore,
+      settings,
+      storageStats: new StorageStats({
+        cache: cacheManager,
+        store: playlistStore,
+        dbFile: join(userData, 'player.db'),
+        pendingPlaybackLogs: () => playbackReporter.pendingCount()
+      }),
+      sync,
+      device: deviceService,
+      diagnostics,
+      defaultCacheDir,
+      cacheDirFallbackReason: chosenCacheDir.fallbackReason,
+      backendUrl: config.baseUrl,
+      isOnline: () => net.isOnline(),
+      appInfo: () => ({ version: app.getVersion(), electron: process.versions.electron }),
+      memory: () => ({
+        appBytes: app.getAppMetrics().reduce((sum, m) => sum + m.memory.workingSetSize * 1024, 0),
+        systemTotalBytes: totalmem(),
+        systemFreeBytes: freemem()
+      }),
+      applyKeepScreenOn
+    })
     disposeIpc = registerIpc({
       deviceService,
       diagnostics,
@@ -163,6 +208,20 @@ if (!app.requestSingleInstanceLock()) {
       isOnline: () => net.isOnline(),
       getPlayerPlaylist: () => toPlayerPlaylist(playlistStore.getActivePlaylist(), mediaUrlFor),
       onPlaylistChanged: (listener) => sync.onPlaylistChanged(listener),
+      maintenance,
+      chooseDirectory: async (defaultPath) => {
+        const options = {
+          title: 'Pilih folder cache konten',
+          defaultPath: defaultPath ?? undefined,
+          properties: ['openDirectory', 'createDirectory'] as (
+            'openDirectory' | 'createDirectory'
+          )[]
+        }
+        const result = mainWindow
+          ? await dialog.showOpenDialog(mainWindow, options)
+          : await dialog.showOpenDialog(options)
+        return result.canceled || result.filePaths.length === 0 ? null : result.filePaths[0]
+      },
       recordPlayback: (event) => {
         playbackReporter.record(event)
         playbackStatus.noteActivity()
